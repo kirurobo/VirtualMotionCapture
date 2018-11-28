@@ -15,8 +15,15 @@ namespace VirtualMotionCaptureControlPanel
     {
         public static string[] CommandLineArgs { get; private set; }
         private void Application_Startup(object sender, StartupEventArgs e) {
-            if (e.Args.Length == 0) return;
-            CommandLineArgs = e.Args;
+            if (e.Args.Length == 0)
+            {
+                // 引数省略時は、VMCのデフォルトパイプ名を利用する
+                CommandLineArgs = new string[] { "/pipeName", "VMCTest" };
+            }
+            else
+            {
+                CommandLineArgs = e.Args;
+            }
             LanguageSelector.SetAutoLanguage();
         }
     }

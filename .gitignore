@@ -11,12 +11,15 @@ Assets/ExternalPlugins/VRM.Samples*
 Assets/ExternalPlugins/StreamingAssets*
 Assets/ExternalPlugins/OVRLipSync*
 Assets/ExternalPlugins/Oculus*
+Assets/ExternalPlugins/UnityNamedePipe/UnityNamedPipe.*
+Assets/Plugins/
 ControlWindowSeparateThreadBackup*
 Assembly*.csproj
 OVR*.sln
 VirtualMotionCapture.sln
 ControlWindow/bin*
 ControlWindow/ControlWindowTester/bin*
+ControlWindowWPF/ControlWindowWPF/bin/
 VirtualMotionCapture/
 HandPresets/
 VMCPipeServerTest/
