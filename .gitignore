@@ -11,7 +11,7 @@ Assets/ExternalPlugins/VRM.Samples*
 Assets/ExternalPlugins/StreamingAssets*
 Assets/ExternalPlugins/OVRLipSync*
 Assets/ExternalPlugins/Oculus*
-Assets/ExternalPlugins/UnityNamedePipe/UnityNamedPipe.*
+Assets/ExternalPlugins/UnityNamedPipe/UnityNamedPipe.*
 Assets/Plugins/
 ControlWindowSeparateThreadBackup*
 Assembly*.csproj
