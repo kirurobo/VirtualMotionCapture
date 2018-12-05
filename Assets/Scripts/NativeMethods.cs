@@ -52,7 +52,8 @@ namespace Assets.Scripts
 
         [DllImport("user32.dll")]
         public static extern IntPtr FindWindow(string className, string windowName);
-        public static IntPtr GetUnityWindowHandle() => FindWindow(null, Application.productName);
+        public static IntPtr CurrentWindowHandle = IntPtr.Zero;
+        public static IntPtr GetUnityWindowHandle() => CurrentWindowHandle == IntPtr.Zero ? CurrentWindowHandle = FindWindow(null, Application.productName) : CurrentWindowHandle;
 
         [DllImport("user32.dll")]
         public static extern int SetWindowLong(IntPtr hWnd, int nIndex, uint dwNewLong); /*x uint o int unchecked*/
@@ -111,6 +112,41 @@ namespace Assets.Scripts
         public const int GWL_EXSTYLE = -20;
         public const uint WS_EX_LAYERED = 0x00080000;
         public const uint WS_EX_TRANSPARENT = 0x00000020;
+
+
+        public delegate bool EnumWindowsDelegate(IntPtr hWnd, IntPtr lparam);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private extern static bool EnumWindows(EnumWindowsDelegate lpEnumFunc, IntPtr lparam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern int GetWindowTextLength(IntPtr hWnd);
+
+        public static Dictionary<IntPtr, string> GetAllWindowHandle()
+        {
+            var ret = new Dictionary<IntPtr, string>();
+            Func<IntPtr, IntPtr, bool> func = new Func<IntPtr, IntPtr, bool>((hWnd, lparam) =>
+            {
+                int textLen = GetWindowTextLength(hWnd);
+                if (0 < textLen)
+                {
+                    //ウィンドウのタイトルを取得する
+                    StringBuilder tsb = new StringBuilder(textLen + 1);
+                    GetWindowText(hWnd, tsb, tsb.Capacity);
+
+                    ret.Add(hWnd, tsb.ToString());
+                }
+                return true;
+            });
+            EnumWindows(new EnumWindowsDelegate(func), IntPtr.Zero);
+
+            return ret;
+        }
+
         #endregion
     }
 }
