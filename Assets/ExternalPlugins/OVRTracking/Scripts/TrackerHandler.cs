@@ -14,6 +14,8 @@ namespace sh_akira.OVRTracking
         public List<GameObject> ControllersObject = new List<GameObject>();
         public GameObject CameraControllerObject;
         [System.NonSerialized]
+        public ETrackedDeviceClass CameraControllerType = ETrackedDeviceClass.Invalid;
+        [System.NonSerialized]
         public string CameraControllerName = null;
         [System.NonSerialized]
         public List<GameObject> Trackers = new List<GameObject>();
@@ -65,7 +67,11 @@ namespace sh_akira.OVRTracking
                     CameraControllerObject.transform.SetPositionAndRotationLocal(cameracontroller);
                     foreach (var l in positions)
                     {
-                        if (l.Value.Contains(cameracontroller)) l.Value.Remove(cameracontroller);
+                        if (l.Value.Contains(cameracontroller))
+                        {
+                            CameraControllerType = l.Key;
+                            l.Value.Remove(cameracontroller);
+                        }
                     }
                 }
 
@@ -77,6 +83,7 @@ namespace sh_akira.OVRTracking
                 var controllerPositions = positions[ETrackedDeviceClass.Controller];
                 if (controllerPositions.Any())
                 {
+                    if (Controllers.Count != controllerPositions.Count) Controllers.Clear();
                     for (int i = 0; i < controllerPositions.Count && i < ControllersObject.Count; i++)
                     {
                         ControllersObject[i].transform.SetPositionAndRotationLocal(controllerPositions[i]);
@@ -86,6 +93,7 @@ namespace sh_akira.OVRTracking
                 var trackerPositions = positions[ETrackedDeviceClass.GenericTracker];
                 if (trackerPositions.Any())
                 {
+                    if (Trackers.Count != trackerPositions.Count) Trackers.Clear();
                     for (int i = 0; i < trackerPositions.Count && i < TrackersObject.Count; i++)
                     {
                         TrackersObject[i].transform.SetPositionAndRotationLocal(trackerPositions[i]);
@@ -96,6 +104,7 @@ namespace sh_akira.OVRTracking
                 var baseStationPositions = positions[ETrackedDeviceClass.TrackingReference];
                 if (baseStationPositions.Any())
                 {
+                    if (BaseStations.Count != baseStationPositions.Count) BaseStations.Clear();
                     for (int i = 0; i < baseStationPositions.Count && i < BaseStationsObject.Count; i++)
                     {
                         BaseStationsObject[i].transform.SetPositionAndRotationLocal(baseStationPositions[i]);
@@ -115,7 +124,7 @@ namespace sh_akira.OVRTracking
         }
     }
 
-    public static class TransformExtensions
+    public static class TrackerTransformExtensions
     {
         private static Dictionary<string, Vector3> lastPositions = new Dictionary<string, Vector3>();
 

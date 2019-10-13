@@ -9,7 +9,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Runtime.Serialization;
 using UnityEngine;
-using UnityNamedPipe;
+using UnityMemoryMappedFile;
 using VRM;
 using static Assets.Scripts.NativeMethods;
 using RootMotion.FinalIK;
@@ -36,8 +36,6 @@ public class ControlWPFWindow : MonoBehaviour
     public Camera BackCamera;
     public Camera PositionFixedCamera;
 
-    public PositionFixedCamera positionFixedCamera;
-
     public Renderer BackgroundRenderer;
 
     public GameObject GridCanvas;
@@ -47,9 +45,7 @@ public class ControlWPFWindow : MonoBehaviour
     public FaceController faceController;
     public HandController handController;
 
-    public OVRControllerAction controllerAction;
-
-    public MainThreadInvoker mainThreadInvoker;
+    public SteamVR2Input steamVR2Input;
 
     public WristRotationFix wristRotationFix;
 
@@ -58,7 +54,7 @@ public class ControlWPFWindow : MonoBehaviour
     public Transform PelvisTrackerRoot;
     public Transform RealTrackerRoot;
 
-    private NamedPipeServer server;
+    public MemoryMappedFileServer server;
     private string pipeName = Guid.NewGuid().ToString();
 
     private GameObject CurrentModel = null;
@@ -66,15 +62,12 @@ public class ControlWPFWindow : MonoBehaviour
     private RootMotion.FinalIK.VRIK vrik = null;
 
     private Camera currentCamera;
-    private CameraLookTarget currentCameraLookTarget = null;
 
     private Animator animator = null;
 
-    private bool IsOculus { get { return controllerAction.IsOculus; } }
-
     private int CurrentWindowNum = 1;
 
-    private enum MouseButtons
+    public enum MouseButtons
     {
         Left = 0,
         Right = 1,
@@ -84,17 +77,29 @@ public class ControlWPFWindow : MonoBehaviour
     private uint defaultWindowStyle;
     private uint defaultExWindowStyle;
 
+    private System.Threading.SynchronizationContext context = null;
+
+    public Action<GameObject> ModelLoadedAction = null;
+    public Action<GameObject> AdditionalSettingAction = null;
+
+    public Action<GameObject> EyeTracking_TobiiCalibrationAction = null;
+    public Action<PipeCommands.SetEyeTracking_TobiiOffsets> SetEyeTracking_TobiiOffsetsAction = null;
+    public Action<PipeCommands.SetEyeTracking_ViveProEyeOffsets> SetEyeTracking_ViveProEyeOffsetsAction = null;
+    public Action<PipeCommands.SetEyeTracking_ViveProEyeUseEyelidMovements> SetEyeTracking_ViveProEyeUseEyelidMovementsAction = null;
+
     // Use this for initialization
     void Start()
     {
+        context = System.Threading.SynchronizationContext.Current;
+
 #if UNITY_EDITOR   // エディタ上でしか動きません。
-        EditorApplication.playModeStateChanged += EditorApplication_playModeStateChanged;//UnityエディタでPlayやStopした時の状態変化イベント
         pipeName = "VMCTest";
 #else
+        Debug.unityLogger.logEnabled = false;
         CurrentWindowNum = SetWindowTitle();
         pipeName = "VMCpipe" + Guid.NewGuid().ToString();
 #endif
-        server = new NamedPipeServer();
+        server = new MemoryMappedFileServer();
         server.ReceivedEvent += Server_Received;
         server.Start(pipeName);
 
@@ -110,9 +115,9 @@ public class ControlWPFWindow : MonoBehaviour
         CurrentSettings.BackgroundColor = BackgroundRenderer.material.color;
         CurrentSettings.CustomBackgroundColor = BackgroundRenderer.material.color;
 
-        controllerAction.KeyDownEvent += ControllerAction_KeyDown;
-        controllerAction.KeyUpEvent += ControllerAction_KeyUp;
-        controllerAction.AxisChangedEvent += ControllerAction_AxisChanged;
+        steamVR2Input.KeyDownEvent += ControllerAction_KeyDown;
+        steamVR2Input.KeyUpEvent += ControllerAction_KeyUp;
+        steamVR2Input.AxisChangedEvent += ControllerAction_AxisChanged;
 
         KeyboardAction.KeyDownEvent += KeyboardAction_KeyDown;
         KeyboardAction.KeyUpEvent += KeyboardAction_KeyUp;
@@ -131,9 +136,23 @@ public class ControlWPFWindow : MonoBehaviour
         return setWindowNum;
     }
 
+    private int doSendTrackerMoved = 0;
+    private Dictionary<string, DateTime> trackerMovedLastSendTime = new Dictionary<string, DateTime>();
     private async void TransformExtensions_TrackerMovedEvent(object sender, string e)
     {
-        await server.SendCommandAsync(new PipeCommands.TrackerMoved { SerialNumber = e });
+        if (doSendTrackerMoved > 0)
+        {
+            if (trackerMovedLastSendTime.ContainsKey(e) == false)
+            {
+                trackerMovedLastSendTime.Add(e, DateTime.Now);
+            }
+            else if (DateTime.Now - trackerMovedLastSendTime[e] < TimeSpan.FromSeconds(1))
+            {
+                return;
+            }
+            await server.SendCommandAsync(new PipeCommands.TrackerMoved { SerialNumber = e });
+            trackerMovedLastSendTime[e] = DateTime.Now;
+        }
     }
 
     private bool ControlPanelExecuted = false;
@@ -162,36 +181,23 @@ public class ControlWPFWindow : MonoBehaviour
     private void OnApplicationQuit()
     {
         server.ReceivedEvent -= Server_Received;
-        server?.Stop();
+        server?.Dispose();
         KeyboardAction.KeyDownEvent -= KeyboardAction_KeyDown;
         KeyboardAction.KeyUpEvent -= KeyboardAction_KeyUp;
 
-        controllerAction.KeyDownEvent -= ControllerAction_KeyDown;
-        controllerAction.KeyUpEvent -= ControllerAction_KeyUp;
-        controllerAction.AxisChangedEvent -= ControllerAction_AxisChanged;
+        steamVR2Input.KeyDownEvent -= ControllerAction_KeyDown;
+        steamVR2Input.KeyUpEvent -= ControllerAction_KeyUp;
+        steamVR2Input.AxisChangedEvent -= ControllerAction_AxisChanged;
     }
 
-#if UNITY_EDITOR   // エディタ上でしか動きません。
-    private void EditorApplication_playModeStateChanged(PlayModeStateChange state)
+    private void Server_Received(object sender, DataReceivedEventArgs e)
     {
-        if (state == PlayModeStateChange.ExitingPlayMode)
-        {
-            server.ReceivedEvent -= Server_Received;
-            server.Stop();
-            //OpenVRWrapper.Instance.Close();
-            //SteamVR.SafeDispose();
-        }
-    }
-#endif
-
-    private async void Server_Received(object sender, DataReceivedEventArgs e)
-    {
-        await mainThreadInvoker.InvokeAsync(async () =>
+        context.Post(async s =>
         {
             if (e.CommandType == typeof(PipeCommands.LoadVRM))
             {
                 var d = (PipeCommands.LoadVRM)e.Data;
-                await server.SendCommandAsync(new PipeCommands.ReturnLoadVRM { Data = LoadVRM() }, e.RequestId);
+                await server.SendCommandAsync(new PipeCommands.ReturnLoadVRM { Data = LoadVRM(d.Path) }, e.RequestId);
             }
             else if (e.CommandType == typeof(PipeCommands.ImportVRM))
             {
@@ -284,7 +290,11 @@ public class ControlWPFWindow : MonoBehaviour
                 var d = (PipeCommands.SetCameraMirror)e.Data;
                 SetCameraMirror(d.enable);
             }
-
+            else if (e.CommandType == typeof(PipeCommands.SetCameraFOV))
+            {
+                var d = (PipeCommands.SetCameraFOV)e.Data;
+                SetCameraFOV(d.value);
+            }
             else if (e.CommandType == typeof(PipeCommands.SetAutoBlinkEnable))
             {
                 var d = (PipeCommands.SetAutoBlinkEnable)e.Data;
@@ -322,20 +332,35 @@ public class ControlWPFWindow : MonoBehaviour
             }
             else if (e.CommandType == typeof(PipeCommands.LoadSettings))
             {
-                LoadSettings();
+                var d = (PipeCommands.LoadSettings)e.Data;
+                LoadSettings(false, false, d.Path);
             }
             else if (e.CommandType == typeof(PipeCommands.SaveSettings))
             {
-                SaveSettings();
+                var d = (PipeCommands.SaveSettings)e.Data;
+                SaveSettings(d.Path);
             }
             else if (e.CommandType == typeof(PipeCommands.SetControllerTouchPadPoints))
             {
                 var d = (PipeCommands.SetControllerTouchPadPoints)e.Data;
-                CurrentSettings.IsOculus = d.IsOculus;
-                CurrentSettings.LeftCenterEnable = d.LeftCenterEnable;
-                CurrentSettings.RightCenterEnable = d.RightCenterEnable;
-                CurrentSettings.LeftTouchPadPoints = d.LeftPoints;
-                CurrentSettings.RightTouchPadPoints = d.RightPoints;
+                if (d.isStick)
+                {
+                    CurrentSettings.LeftThumbStickPoints = d.LeftPoints;
+                    CurrentSettings.RightThumbStickPoints = d.RightPoints;
+                }
+                else
+                {
+                    CurrentSettings.LeftCenterEnable = d.LeftCenterEnable;
+                    CurrentSettings.RightCenterEnable = d.RightCenterEnable;
+                    CurrentSettings.LeftTouchPadPoints = d.LeftPoints;
+                    CurrentSettings.RightTouchPadPoints = d.RightPoints;
+                }
+            }
+            else if (e.CommandType == typeof(PipeCommands.SetSkeletalInputEnable))
+            {
+                var d = (PipeCommands.SetSkeletalInputEnable)e.Data;
+                CurrentSettings.EnableSkeletal = d.enable;
+                steamVR2Input.EnableSkeletal = CurrentSettings.EnableSkeletal;
             }
             else if (e.CommandType == typeof(PipeCommands.StartHandCamera))
             {
@@ -361,6 +386,16 @@ public class ControlWPFWindow : MonoBehaviour
             {
                 faceController.EndSetting();
                 doKeyConfig = false;
+                CurrentKeyConfigs.Clear();
+            }
+            else if (e.CommandType == typeof(PipeCommands.StartKeySend))
+            {
+                doKeySend = true;
+                CurrentKeyConfigs.Clear();
+            }
+            else if (e.CommandType == typeof(PipeCommands.EndKeySend))
+            {
+                doKeySend = false;
                 CurrentKeyConfigs.Clear();
             }
             else if (e.CommandType == typeof(PipeCommands.SetKeyActions))
@@ -399,7 +434,7 @@ public class ControlWPFWindow : MonoBehaviour
                 var tracker = handler.GetTrackerTransformByName(d.ControllerName);
                 //InverseTransformPoint  Thanks: えむにわ(@m2wasabi)
                 var rposition = tracker.InverseTransformPoint(currentCamera.transform.position);
-                var rrotation = currentCamera.transform.eulerAngles - tracker.eulerAngles;
+                var rrotation = (Quaternion.Inverse(tracker.rotation) * currentCamera.transform.rotation).eulerAngles;
                 await server.SendCommandAsync(new PipeCommands.SetExternalCameraConfig
                 {
                     x = rposition.x,
@@ -470,7 +505,83 @@ public class ControlWPFWindow : MonoBehaviour
             else if (e.CommandType == typeof(PipeCommands.SetResolution))
             {
                 var d = (PipeCommands.SetResolution)e.Data;
+                CurrentSettings.ScreenWidth = d.Width;
+                CurrentSettings.ScreenHeight = d.Height;
+                CurrentSettings.ScreenRefreshRate = d.RefreshRate;
                 Screen.SetResolution(d.Width, d.Height, false, d.RefreshRate);
+            }
+            else if (e.CommandType == typeof(PipeCommands.TakePhoto))
+            {
+                var d = (PipeCommands.TakePhoto)e.Data;
+                TakePhoto(d.Width, d.TransparentBackground, d.Directory);
+            }
+            else if (e.CommandType == typeof(PipeCommands.SetLightAngle))
+            {
+                var d = (PipeCommands.SetLightAngle)e.Data;
+                SetLightAngle(d.X, d.Y);
+            }
+            else if (e.CommandType == typeof(PipeCommands.ChangeLightColor))
+            {
+                var d = (PipeCommands.ChangeLightColor)e.Data;
+                ChangeLightColor(d.a, d.r, d.g, d.b);
+            }
+            else if (e.CommandType == typeof(PipeCommands.TrackerMovedRequest))
+            {
+                var d = (PipeCommands.TrackerMovedRequest)e.Data;
+                if (d.doSend)
+                {
+                    doSendTrackerMoved++;
+                }
+                else
+                {
+                    doSendTrackerMoved--;
+                }
+            }
+            else if (e.CommandType == typeof(PipeCommands.SetEyeTracking_TobiiOffsets))
+            {
+                var d = (PipeCommands.SetEyeTracking_TobiiOffsets)e.Data;
+                SetEyeTracking_TobiiOffsets(d);
+            }
+            else if (e.CommandType == typeof(PipeCommands.GetEyeTracking_TobiiOffsets))
+            {
+                await server.SendCommandAsync(new PipeCommands.SetEyeTracking_TobiiOffsets
+                {
+                    OffsetHorizontal = CurrentSettings.EyeTracking_TobiiOffsetHorizontal,
+                    OffsetVertical = CurrentSettings.EyeTracking_TobiiOffsetVertical,
+                    ScaleHorizontal = CurrentSettings.EyeTracking_TobiiScaleHorizontal,
+                    ScaleVertical = CurrentSettings.EyeTracking_TobiiScaleVertical
+                }, e.RequestId);
+            }
+            else if (e.CommandType == typeof(PipeCommands.EyeTracking_TobiiCalibration))
+            {
+                EyeTracking_TobiiCalibrationAction?.Invoke(CurrentModel);
+            }
+            else if (e.CommandType == typeof(PipeCommands.SetEyeTracking_ViveProEyeOffsets))
+            {
+                var d = (PipeCommands.SetEyeTracking_ViveProEyeOffsets)e.Data;
+                SetEyeTracking_ViveProEyeOffsets(d);
+            }
+            else if (e.CommandType == typeof(PipeCommands.GetEyeTracking_ViveProEyeOffsets))
+            {
+                await server.SendCommandAsync(new PipeCommands.SetEyeTracking_ViveProEyeOffsets
+                {
+                    OffsetHorizontal = CurrentSettings.EyeTracking_ViveProEyeOffsetHorizontal,
+                    OffsetVertical = CurrentSettings.EyeTracking_ViveProEyeOffsetVertical,
+                    ScaleHorizontal = CurrentSettings.EyeTracking_ViveProEyeScaleHorizontal,
+                    ScaleVertical = CurrentSettings.EyeTracking_ViveProEyeScaleVertical
+                }, e.RequestId);
+            }
+            else if (e.CommandType == typeof(PipeCommands.SetEyeTracking_ViveProEyeUseEyelidMovements))
+            {
+                var d = (PipeCommands.SetEyeTracking_ViveProEyeUseEyelidMovements)e.Data;
+                SetEyeTracking_ViveProEyeUseEyelidMovements(d);
+            }
+            else if (e.CommandType == typeof(PipeCommands.GetEyeTracking_ViveProEyeUseEyelidMovements))
+            {
+                await server.SendCommandAsync(new PipeCommands.SetEyeTracking_ViveProEyeUseEyelidMovements
+                {
+                    Use = CurrentSettings.EyeTracking_ViveProEyeUseEyelidMovements,
+                }, e.RequestId);
             }
             else if (e.CommandType == typeof(PipeCommands.LoadCurrentSettings))
             {
@@ -479,23 +590,62 @@ public class ControlWPFWindow : MonoBehaviour
                     isFirstTimeExecute = false;
                     //起動時は初期設定ロード
                     LoadSettings(true, true);
-                    TransformExtensions.TrackerMovedEvent += TransformExtensions_TrackerMovedEvent;
+                    TrackerTransformExtensions.TrackerMovedEvent += TransformExtensions_TrackerMovedEvent;
                 }
                 else
                 {
                     LoadSettings(true, false);
                 }
             }
-        });
+            else if (e.CommandType == typeof(PipeCommands.ImportCameraPlus))
+            {
+                var d = (PipeCommands.ImportCameraPlus)e.Data;
+                ImportCameraPlus(d);
+            }
+            else if (e.CommandType == typeof(PipeCommands.ExportCameraPlus))
+            {
+                await server.SendCommandAsync(new PipeCommands.ReturnExportCameraPlus
+                {
+                    x = CurrentSettings.FreeCameraTransform.localPosition.x,
+                    y = CurrentSettings.FreeCameraTransform.localPosition.y,
+                    z = CurrentSettings.FreeCameraTransform.localPosition.z,
+                    rx = CurrentSettings.FreeCameraTransform.localRotation.eulerAngles.x,
+                    ry = CurrentSettings.FreeCameraTransform.localRotation.eulerAngles.y,
+                    rz = CurrentSettings.FreeCameraTransform.localRotation.eulerAngles.z,
+                    fov = currentCamera.fieldOfView
+                }, e.RequestId);
+            }
+        }, null);
+    }
+
+    public Transform MainDirectionalLightTransform;
+    public Light MainDirectionalLight;
+
+    private void SetLightAngle(float x, float y)
+    {
+        if (MainDirectionalLightTransform != null)
+        {
+            MainDirectionalLightTransform.eulerAngles = new Vector3(x, y, MainDirectionalLightTransform.eulerAngles.z);
+            CurrentSettings.LightRotationX = x;
+            CurrentSettings.LightRotationY = y;
+        }
+    }
+
+    private void ChangeLightColor(float a, float r, float g, float b)
+    {
+        if (MainDirectionalLight != null)
+        {
+            CurrentSettings.LightColor = new Color(r, g, b, a);
+            MainDirectionalLight.color = CurrentSettings.LightColor;
+        }
     }
 
     private bool isFirstTimeExecute = true;
 
     #region VRM
 
-    private VRMData LoadVRM()
+    private VRMData LoadVRM(string path)
     {
-        var path = WindowsDialogs.OpenFileDialog("VRMファイル選択", ".vrm");
         if (string.IsNullOrEmpty(path))
         {
             return null;
@@ -524,14 +674,14 @@ public class ControlWPFWindow : MonoBehaviour
         vrmdata.Reference = meta.Reference;
 
         // Permission
-        vrmdata.AllowedUser = (UnityNamedPipe.AllowedUser)meta.AllowedUser;
-        vrmdata.ViolentUssage = (UnityNamedPipe.UssageLicense)meta.ViolentUssage;
-        vrmdata.SexualUssage = (UnityNamedPipe.UssageLicense)meta.SexualUssage;
-        vrmdata.CommercialUssage = (UnityNamedPipe.UssageLicense)meta.CommercialUssage;
+        vrmdata.AllowedUser = (UnityMemoryMappedFile.AllowedUser)meta.AllowedUser;
+        vrmdata.ViolentUssage = (UnityMemoryMappedFile.UssageLicense)meta.ViolentUssage;
+        vrmdata.SexualUssage = (UnityMemoryMappedFile.UssageLicense)meta.SexualUssage;
+        vrmdata.CommercialUssage = (UnityMemoryMappedFile.UssageLicense)meta.CommercialUssage;
         vrmdata.OtherPermissionUrl = meta.OtherPermissionUrl;
 
         // Distribution License
-        vrmdata.LicenseType = (UnityNamedPipe.LicenseType)meta.LicenseType;
+        vrmdata.LicenseType = (UnityMemoryMappedFile.LicenseType)meta.LicenseType;
         vrmdata.OtherLicenseUrl = meta.OtherLicenseUrl;
         /*
         // ParseしたJSONをシーンオブジェクトに変換していく
@@ -544,21 +694,72 @@ public class ControlWPFWindow : MonoBehaviour
         */
         return vrmdata;
     }
-    public float LeftLowerArmAngle = -60f;
-    public float RightLowerArmAngle = -60f;
-    public float LeftUpperArmAngle = -60f;
-    public float RightUpperArmAngle = -60f;
+    private const float LeftLowerArmAngle = -30f;
+    private const float RightLowerArmAngle = -30f;
+    private const float LeftUpperArmAngle = -30f;
+    private const float RightUpperArmAngle = -30f;
+    private const float LeftHandAngle = -30f;
+    private const float RightHandAngle = -30f;
 
     private async void ImportVRM(string path, bool ImportForCalibration, bool EnableNormalMapFix, bool DeleteHairNormalMap)
     {
-        CurrentSettings.VRMPath = path;
-        var context = new VRMImporterContext();
+        if (ImportForCalibration == false)
+        {
+            CurrentSettings.VRMPath = path;
+            var context = new VRMImporterContext();
 
-        var bytes = File.ReadAllBytes(path);
+            var bytes = File.ReadAllBytes(path);
 
-        // GLB形式でJSONを取得しParseします
-        context.ParseGlb(bytes);
+            // GLB形式でJSONを取得しParseします
+            context.ParseGlb(bytes);
 
+            // ParseしたJSONをシーンオブジェクトに変換していく
+            //CurrentModel = await VRMImporter.LoadVrmAsync(context);
+            await context.LoadAsyncTask();
+            context.ShowMeshes();
+
+            LoadNewModel(context.Root);
+        }
+        else
+        {
+            if (CurrentModel != null)
+            {
+                var currentvrik = CurrentModel.GetComponent<VRIK>();
+                if (currentvrik != null) Destroy(currentvrik);
+            }
+            LoadDefaultCurrentModelTransforms();
+            //SetVRIK(CurrentModel);
+            if (animator != null)
+            {
+                animator.GetBoneTransform(HumanBodyBones.LeftLowerArm).localEulerAngles = new Vector3(LeftLowerArmAngle, 0, 0);
+                animator.GetBoneTransform(HumanBodyBones.RightLowerArm).localEulerAngles = new Vector3(RightLowerArmAngle, 0, 0);
+                animator.GetBoneTransform(HumanBodyBones.LeftUpperArm).localEulerAngles = new Vector3(LeftUpperArmAngle, 0, 0);
+                animator.GetBoneTransform(HumanBodyBones.RightUpperArm).localEulerAngles = new Vector3(RightUpperArmAngle, 0, 0);
+                animator.GetBoneTransform(HumanBodyBones.LeftHand).localEulerAngles = new Vector3(LeftHandAngle, 0, 0);
+                animator.GetBoneTransform(HumanBodyBones.RightHand).localEulerAngles = new Vector3(RightHandAngle, 0, 0);
+
+                //wristRotationFix.SetVRIK(vrik);
+
+                handController.SetDefaultAngle(animator);
+
+                //トラッカー位置の表示
+                RealTrackerRoot.gameObject.SetActive(true);
+                foreach (Transform t in RealTrackerRoot)
+                {
+                    t.localPosition = new Vector3(0, -100f, 0);
+                }
+
+                if (CalibrationCamera != null)
+                {
+                    CalibrationCamera.Target = animator.GetBoneTransform(HumanBodyBones.Head);
+                    CalibrationCamera.gameObject.SetActive(true);
+                }
+            }
+        }
+    }
+
+    public void LoadNewModel(GameObject model)
+    {
         if (CurrentModel != null)
         {
             if (LeftHandCamera != null)
@@ -574,19 +775,23 @@ public class ControlWPFWindow : MonoBehaviour
             Destroy(CurrentModel);
             CurrentModel = null;
         }
-        // ParseしたJSONをシーンオブジェクトに変換していく
-        //CurrentModel = await VRMImporter.LoadVrmAsync(context);
-        await context.LoadAsyncTask();
-        context.ShowMeshes();
-        CurrentModel = context.Root;
+        CurrentModel = model;
 
-        CurrentSettings.EnableNormalMapFix = EnableNormalMapFix;
-        CurrentSettings.DeleteHairNormalMap = DeleteHairNormalMap;
-        if (EnableNormalMapFix)
-        {
-            //VRoidモデルのNormalMapテカテカを修正する
-            Yashinut.VRoid.CorrectNormalMapImport.CorrectNormalMap(CurrentModel, DeleteHairNormalMap);
-        }
+        ModelInitialize();
+    }
+
+    public void ModelInitialize()
+    {
+
+        SaveDefaultCurrentModelTransforms();
+
+        //CurrentSettings.EnableNormalMapFix = EnableNormalMapFix;
+        //CurrentSettings.DeleteHairNormalMap = DeleteHairNormalMap;
+        //if (EnableNormalMapFix)
+        //{
+        //    //VRoidモデルのNormalMapテカテカを修正する
+        //    Yashinut.VRoid.CorrectNormalMapImport.CorrectNormalMap(CurrentModel, DeleteHairNormalMap);
+        //}
 
         //モデルのSkinnedMeshRendererがカリングされないように、すべてのオプション変更
         foreach (var renderer in CurrentModel.GetComponentsInChildren<SkinnedMeshRenderer>(true))
@@ -602,7 +807,9 @@ public class ControlWPFWindow : MonoBehaviour
         //CurrentModel.transform.SetParent(transform, false);
 
         animator = CurrentModel.GetComponent<Animator>();
+
         SetVRIK(CurrentModel);
+
         if (animator != null)
         {
             animator.GetBoneTransform(HumanBodyBones.LeftLowerArm).eulerAngles = new Vector3(LeftLowerArmAngle, 0, 0);
@@ -630,26 +837,132 @@ public class ControlWPFWindow : MonoBehaviour
             }
 
         }
-        if (ImportForCalibration == false)
-        {
-            SetCameraLookTarget();
-            //SetTrackersToVRIK();
-        }
-        else
-        {
-            if (animator != null)
-            {
-                //トラッカー位置の表示
-                RealTrackerRoot.gameObject.SetActive(true);
-                foreach (Transform t in RealTrackerRoot)
-                {
-                    t.localPosition = new Vector3(0, -100f, 0);
-                }
+        SetCameraLookTarget();
+        //SetTrackersToVRIK();
 
-                if (CalibrationCamera != null)
+        ModelLoadedAction?.Invoke(CurrentModel);
+    }
+    /*
+    private Vector3 DefaultModelPosition;
+    private Quaternion DefaultModelRotation;
+    private Vector3 DefaultModelScale;
+    private Dictionary<HumanBodyBones, Quaternion> DefaultRotations;
+
+    public void SaveDefaultCurrentModelTransforms()
+    {
+        DefaultModelPosition = CurrentModel.transform.position;
+        DefaultModelRotation = CurrentModel.transform.rotation;
+        DefaultModelScale = CurrentModel.transform.localScale;
+        DefaultRotations = new Dictionary<HumanBodyBones, Quaternion>();
+        var animator = CurrentModel.GetComponent<Animator>();
+        for (int i = 0; i < (int)HumanBodyBones.LastBone; i++)
+        {
+            var t = animator.GetBoneTransform((HumanBodyBones)i);
+            if (t != null)
+            {
+                DefaultRotations.Add((HumanBodyBones)i, t.rotation);
+            }
+        }
+    }
+
+    public void LoadDefaultCurrentModelTransforms()
+    {
+        if (DefaultRotations == null) return;
+        CurrentModel.transform.position = DefaultModelPosition;
+        CurrentModel.transform.rotation = DefaultModelRotation;
+        CurrentModel.transform.localScale = DefaultModelScale;
+        foreach (var pair in DefaultRotations)
+        {
+            var t = animator.GetBoneTransform(pair.Key);
+            if (t != null)
+            {
+                t.rotation = pair.Value;
+            }
+        }
+    }
+    */
+
+    private GameObject PositionSavedModel;
+    private Vector3 DefaultModelPosition;
+    private Quaternion DefaultModelRotation;
+    private Vector3 DefaultModelScale;
+    private Dictionary<Transform, Vector3> DefaultPositions;
+    private Dictionary<Transform, Quaternion> DefaultRotations;
+    private Dictionary<Transform, Vector3> DefaultScales;
+    private Dictionary<VRMSpringBoneColliderGroup.SphereCollider, Vector4> DefaultColliders;
+
+    public void SaveDefaultCurrentModelTransforms()
+    {
+        PositionSavedModel = CurrentModel;
+        DefaultModelPosition = CurrentModel.transform.position;
+        DefaultModelRotation = CurrentModel.transform.rotation;
+        DefaultModelScale = CurrentModel.transform.localScale;
+        DefaultPositions = new Dictionary<Transform, Vector3>();
+        DefaultRotations = new Dictionary<Transform, Quaternion>();
+        DefaultScales = new Dictionary<Transform, Vector3>();
+        DefaultColliders = new Dictionary<VRMSpringBoneColliderGroup.SphereCollider, Vector4>();
+        var allTransforms = CurrentModel.transform.GetComponentsInChildren<Transform>(true);
+        foreach (var t in allTransforms)
+        {
+            DefaultPositions.Add(t, t.position);
+            DefaultRotations.Add(t, t.rotation);
+            DefaultScales.Add(t, t.localScale);
+        }
+
+        //VRMモデルのコライダー
+        var springBoneColiderGroups = CurrentModel.GetComponentsInChildren<VRM.VRMSpringBoneColliderGroup>();
+        foreach (var springBoneColiderGroup in springBoneColiderGroups)
+        {
+            foreach (var collider in springBoneColiderGroup.Colliders)
+            {
+                DefaultColliders.Add(collider, new Vector4(collider.Offset.x, collider.Offset.y, collider.Offset.z, collider.Radius));
+            }
+        }
+    }
+
+    public void LoadDefaultCurrentModelTransforms()
+    {
+        if (PositionSavedModel != CurrentModel || CurrentModel == null) return;
+        CurrentModel.transform.localScale = DefaultModelScale;
+        CurrentModel.transform.rotation = DefaultModelRotation;
+        CurrentModel.transform.position = DefaultModelPosition;
+        var animator = CurrentModel.GetComponent<Animator>();
+        foreach (var pair in DefaultScales)
+        {
+            var t = pair.Key;
+            if (t != null)
+            {
+                t.localScale = pair.Value;
+            }
+        }
+        foreach (var pair in DefaultRotations)
+        {
+            var t = pair.Key;
+            if (t != null)
+            {
+                t.rotation = pair.Value;
+            }
+        }
+        foreach (var pair in DefaultPositions)
+        {
+            var t = pair.Key;
+            if (t != null)
+            {
+                t.position = pair.Value;
+            }
+        }
+
+        //VRMモデルのコライダー
+        var springBoneColiderGroups = CurrentModel.GetComponentsInChildren<VRM.VRMSpringBoneColliderGroup>();
+        foreach (var springBoneColiderGroup in springBoneColiderGroups)
+        {
+            foreach (var collider in springBoneColiderGroup.Colliders)
+            {
+                if (DefaultColliders.ContainsKey(collider))
                 {
-                    CalibrationCamera.Target = animator.GetBoneTransform(HumanBodyBones.Head);
-                    CalibrationCamera.gameObject.SetActive(true);
+                    var col = DefaultColliders[collider];
+                    collider.Offset = new Vector3(col.x, col.y, col.z);
+                    collider.Radius = col.w;
                 }
             }
         }
@@ -707,7 +1020,6 @@ public class ControlWPFWindow : MonoBehaviour
             fixPelvisBone(animator.GetBoneTransform(HumanBodyBones.Spine), animator.GetBoneTransform(HumanBodyBones.Hips));
         }
 
-
         vrik = model.AddComponent<RootMotion.FinalIK.VRIK>();
         vrik.solver.IKPositionWeight = 0f;
         vrik.solver.leftArm.stretchCurve = new AnimationCurve();
@@ -748,14 +1060,17 @@ public class ControlWPFWindow : MonoBehaviour
         {
             list.Add(Tuple.Create("HMD", handler.HMDObject.transform.name));
         }
+        //if (handler.CameraControllerType == ETrackedDeviceClass.HMD) list.Add(Tuple.Create("HMD", handler.CameraControllerObject.transform.name));
         foreach (var controller in handler.Controllers)
         {
             list.Add(Tuple.Create("コントローラー", controller.transform.name));
         }
+        if (handler.CameraControllerType == ETrackedDeviceClass.Controller) list.Add(Tuple.Create("コントローラー", handler.CameraControllerObject.transform.name));
         foreach (var tracker in handler.Trackers)
         {
             list.Add(Tuple.Create("トラッカー", tracker.transform.name));
         }
+        if (handler.CameraControllerType == ETrackedDeviceClass.GenericTracker) list.Add(Tuple.Create("トラッカー", handler.CameraControllerObject.transform.name));
         return list;
     }
 
@@ -976,6 +1291,10 @@ public class ControlWPFWindow : MonoBehaviour
 
     private IEnumerator Calibrate(PipeCommands.CalibrateType calibrateType)
     {
+
+        SetVRIK(CurrentModel);
+        wristRotationFix.SetVRIK(vrik);
+
         Transform headTracker = GetTrackerTransformBySerialNumber(CurrentSettings.Head, TargetType.Head);
         leftHandTracker = GetTrackerTransformBySerialNumber(CurrentSettings.LeftHand, TargetType.LeftArm, headTracker);
         rightHandTracker = GetTrackerTransformBySerialNumber(CurrentSettings.RightHand, TargetType.RightArm, headTracker);
@@ -1030,7 +1349,7 @@ public class ControlWPFWindow : MonoBehaviour
         }
 
         vrik.solver.IKPositionWeight = 1.0f;
-        if (handler.Trackers.Count == 1)
+        if (leftFootTracker == null && rightFootTracker == null)
         {
             vrik.solver.plantFeet = true;
             vrik.solver.locomotion.weight = 1.0f;
@@ -1192,8 +1511,6 @@ public class ControlWPFWindow : MonoBehaviour
     #region CameraControl
 
 
-    private Vector3 cameraMouseOldPos; // マウスの位置を保存する変数
-
     private void ChangeCamera(CameraTypes type)
     {
         if (type == CameraTypes.Free)
@@ -1226,8 +1543,8 @@ public class ControlWPFWindow : MonoBehaviour
             }
             camera.gameObject.SetActive(true);
             if (currentCamera != null && currentCamera != camera) currentCamera.gameObject.SetActive(false);
+            camera.GetComponent<CameraMouseControl>().enabled = true;
             currentCamera = camera;
-            currentCameraLookTarget = camera.gameObject.GetComponent<CameraLookTarget>();
             SetCameraMirrorEnable(CurrentSettings.CameraMirrorEnable);
         }
     }
@@ -1266,140 +1583,23 @@ public class ControlWPFWindow : MonoBehaviour
             var gameObject = new GameObject("CameraLook");
             gameObject.transform.position = calcPosition;
             gameObject.transform.rotation = spineTransform.rotation;
-            gameObject.transform.parent = bodyTracker == null ? animator.GetBoneTransform(HumanBodyBones.Spine) : CurrentModel.transform;
-            var lookTarget = FrontCamera.GetComponent<CameraLookTarget>();
+            gameObject.transform.parent =/* bodyTracker == null ? animator.GetBoneTransform(HumanBodyBones.Spine) :*/ CurrentModel.transform;
+            var lookTarget = FrontCamera.GetComponent<CameraMouseControl>();
             if (lookTarget != null)
             {
-                lookTarget.Target = gameObject.transform;
+                lookTarget.LookTarget = gameObject.transform;
             }
-            lookTarget = BackCamera.GetComponent<CameraLookTarget>();
+            lookTarget = BackCamera.GetComponent<CameraMouseControl>();
             if (lookTarget != null)
             {
-                lookTarget.Target = gameObject.transform;
+                lookTarget.LookTarget = gameObject.transform;
             }
-            if (positionFixedCamera == null) positionFixedCamera = PositionFixedCamera.GetComponent<PositionFixedCamera>();
+            var positionFixedCamera = PositionFixedCamera.GetComponent<CameraMouseControl>();
             if (positionFixedCamera != null)
             {
-                positionFixedCamera.Target = gameObject.transform;
+                positionFixedCamera.PositionFixedTarget = gameObject.transform;
             }
         }
-    }
-
-    private void SaveLookTarget(Camera camera)
-    {
-        if (camera == FrontCamera)
-        {
-            if (CurrentSettings.FrontCameraLookTargetSettings == null)
-            {
-                CurrentSettings.FrontCameraLookTargetSettings = LookTargetSettings.Create(currentCameraLookTarget);
-            }
-            else
-            {
-                CurrentSettings.FrontCameraLookTargetSettings.Set(currentCameraLookTarget);
-            }
-        }
-        else if (camera == BackCamera)
-        {
-            if (CurrentSettings.BackCameraLookTargetSettings == null)
-            {
-                CurrentSettings.BackCameraLookTargetSettings = LookTargetSettings.Create(currentCameraLookTarget);
-            }
-            else
-            {
-                CurrentSettings.BackCameraLookTargetSettings.Set(currentCameraLookTarget);
-            }
-        }
-    }
-
-    // マウス関係のイベント
-    private void CameraMouseEvent()
-    {
-        float delta = Input.GetAxis("Mouse ScrollWheel");
-        if (delta != 0.0f)
-        {
-            if (CurrentSettings.CameraType == CameraTypes.Free) //フリーカメラ
-            {
-                currentCamera.transform.position += currentCamera.transform.forward * delta;
-                if (CurrentSettings.FreeCameraTransform == null) CurrentSettings.FreeCameraTransform = new StoreTransform(currentCamera.transform);
-                CurrentSettings.FreeCameraTransform.SetPosition(currentCamera.transform);
-            }
-            else if (CurrentSettings.CameraType == CameraTypes.PositionFixed)
-            {
-                currentCamera.transform.position += currentCamera.transform.forward * delta;
-                if (CurrentSettings.PositionFixedCameraTransform == null) CurrentSettings.PositionFixedCameraTransform = new StoreTransform(currentCamera.transform);
-                CurrentSettings.PositionFixedCameraTransform.SetPosition(currentCamera.transform);
-                positionFixedCamera.UpdatePosition();
-
-            }
-            else //固定カメラ
-            {
-                if (currentCameraLookTarget != null)
-                {
-                    currentCameraLookTarget.Distance += delta;
-                    SaveLookTarget(currentCamera);
-                }
-            }
-        }
-
-        var mousePos = Input.mousePosition;
-
-        // 押されたとき
-        if (Input.GetMouseButtonDown((int)MouseButtons.Right) || Input.GetMouseButtonDown((int)MouseButtons.Center))
-            cameraMouseOldPos = mousePos;
-
-        Vector3 diff = mousePos - cameraMouseOldPos;
-        if (CurrentSettings.CameraMirrorEnable)
-        {
-            diff.x *= -1;
-        }
-
-        // 差分の長さが極小数より小さかったら、ドラッグしていないと判断する
-        if (diff.magnitude >= Vector3.kEpsilon)
-        {
-
-            if (Input.GetMouseButton((int)MouseButtons.Center))
-            { // 注視点
-                if (CurrentSettings.CameraType == CameraTypes.Free) //フリーカメラ
-                {
-                    currentCamera.transform.Translate(-diff * Time.deltaTime * 1.1f);
-                    if (CurrentSettings.FreeCameraTransform == null) CurrentSettings.FreeCameraTransform = new StoreTransform(currentCamera.transform);
-                    CurrentSettings.FreeCameraTransform.SetPosition(currentCamera.transform);
-                }
-                else if (CurrentSettings.CameraType == CameraTypes.PositionFixed)
-                {
-                    currentCamera.transform.Translate(-diff * Time.deltaTime * 1.1f);
-                    if (CurrentSettings.PositionFixedCameraTransform == null) CurrentSettings.PositionFixedCameraTransform = new StoreTransform(currentCamera.transform);
-                    CurrentSettings.PositionFixedCameraTransform.SetPosition(currentCamera.transform);
-                    positionFixedCamera.UpdatePosition();
-                }
-                else //固定カメラ
-                {
-                    currentCameraLookTarget.Offset += new Vector3(0, -diff.y, 0) * Time.deltaTime * 1.1f;
-                    SaveLookTarget(currentCamera);
-                }
-            }
-            else if (Input.GetMouseButton((int)MouseButtons.Right))
-            { // 回転
-                if (CurrentSettings.CameraType == CameraTypes.Free)
-                {
-                    currentCamera.transform.RotateAround(currentCamera.transform.position, currentCamera.transform.right, -diff.y * Time.deltaTime * 30.0f);
-                    currentCamera.transform.RotateAround(currentCamera.transform.position, Vector3.up, diff.x * Time.deltaTime * 30.0f);
-                    if (CurrentSettings.FreeCameraTransform == null) CurrentSettings.FreeCameraTransform = new StoreTransform(currentCamera.transform);
-                    CurrentSettings.FreeCameraTransform.SetRotation(currentCamera.transform);
-                }
-                else if (CurrentSettings.CameraType == CameraTypes.PositionFixed)
-                {
-                    currentCamera.transform.RotateAround(currentCamera.transform.position, currentCamera.transform.right, -diff.y * Time.deltaTime * 30.0f);
-                    currentCamera.transform.RotateAround(currentCamera.transform.position, Vector3.up, diff.x * Time.deltaTime * 30.0f);
-                    if (CurrentSettings.PositionFixedCameraTransform == null) CurrentSettings.PositionFixedCameraTransform = new StoreTransform(currentCamera.transform);
-                    CurrentSettings.PositionFixedCameraTransform.SetRotation(currentCamera.transform);
-                    positionFixedCamera.UpdatePosition();
-                }
-            }
-
-            this.cameraMouseOldPos = mousePos;
-        }
-        return;
     }
 
     private void SetGridVisible(bool enable)
@@ -1418,6 +1618,7 @@ public class ControlWPFWindow : MonoBehaviour
     {
         //フリーカメラに変更
         ChangeCamera(CameraTypes.Free);
+        FreeCamera.GetComponent<CameraMouseControl>().enabled = false;
         //externalcamera.cfgは3つ目のコントローラー基準のポジション
         handler.CameraControllerName = d.ControllerName;
         yield return null;
@@ -1429,6 +1630,43 @@ public class ControlWPFWindow : MonoBehaviour
         //コントローラーは動くのでカメラ位置の保存はできない
         //if (CurrentSettings.FreeCameraTransform == null) CurrentSettings.FreeCameraTransform = new StoreTransform(currentCamera.transform);
         //CurrentSettings.FreeCameraTransform.SetPosition(currentCamera.transform);
+    }
+
+    private async void ImportCameraPlus(PipeCommands.ImportCameraPlus d)
+    {
+        ChangeCamera(CameraTypes.Free);
+        CurrentSettings.FreeCameraTransform.localPosition = new Vector3(d.x, d.y, d.z);
+        CurrentSettings.FreeCameraTransform.localRotation = Quaternion.Euler(d.rx, d.ry, d.rz);
+        FreeCamera.fieldOfView = d.fov;
+        CurrentSettings.FreeCameraTransform.ToLocalTransform(FreeCamera.transform);
+        var control = FreeCamera.GetComponent<CameraMouseControl>();
+        control.CameraAngle = -FreeCamera.transform.rotation.eulerAngles;
+        control.CameraDistance = Vector3.Distance(FreeCamera.transform.localPosition, Vector3.zero);
+        control.CameraTarget = FreeCamera.transform.localPosition + FreeCamera.transform.rotation * Vector3.forward * control.CameraDistance;
+        await server.SendCommandAsync(new PipeCommands.LoadCameraFOV { fov = d.fov });
+    }
+
+    private CameraMouseControl frontCameraMouseControl = null;
+    private CameraMouseControl backCameraMouseControl = null;
+    private CameraMouseControl freeCameraMouseControl = null;
+    private CameraMouseControl positionFixedCameraMouseControl = null;
+
+    private void SetCameraFOV(float fov)
+    {
+        if (frontCameraMouseControl == null)
+        {
+
+
+            frontCameraMouseControl = FrontCamera.GetComponent<CameraMouseControl>();
+            backCameraMouseControl = BackCamera.GetComponent<CameraMouseControl>();
+            freeCameraMouseControl = FreeCamera.GetComponent<CameraMouseControl>();
+            positionFixedCameraMouseControl = PositionFixedCamera.GetComponent<CameraMouseControl>();
+        }
+        CurrentSettings.CameraFOV = fov;
+        frontCameraMouseControl.SetCameraFOV(fov);
+        backCameraMouseControl.SetCameraFOV(fov);
+        freeCameraMouseControl.SetCameraFOV(fov);
+        positionFixedCameraMouseControl.SetCameraFOV(fov);
     }
 
     #endregion
@@ -1500,6 +1738,7 @@ public class ControlWPFWindow : MonoBehaviour
     #region HandFaceControll
 
     private bool doKeyConfig = false;
+    private bool doKeySend = false;
 
     private async void ControllerAction_KeyDown(object sender, OVRKeyEventArgs e)
     {
@@ -1508,10 +1747,10 @@ public class ControlWPFWindow : MonoBehaviour
         var config = new KeyConfig();
         config.type = KeyTypes.Controller;
         config.actionType = KeyActionTypes.Hand;
-        config.keyCode = (int)e.ButtonId;
+        config.keyCode = -2;
+        config.keyName = e.Name;
         config.isLeft = e.IsLeft;
-        config.keyIndex = e.IsAxis == false ? -1 : e.ButtonId == Valve.VR.EVRButtonId.k_EButton_SteamVR_Touchpad ? NearestPointIndex(e.IsLeft, e.Axis.x, e.Axis.y) : 0;
-        config.isOculus = IsOculus;
+        config.keyIndex = e.IsAxis == false ? -1 : NearestPointIndex(e.IsLeft, e.Axis.x, e.Axis.y, e.Name.Contains("Stick"));
         config.isTouch = e.IsTouch;
         if (e.IsAxis)
         {
@@ -1519,8 +1758,8 @@ public class ControlWPFWindow : MonoBehaviour
             if (e.IsLeft) lastLeftAxisPoint = config.keyIndex;
             else lastRightAxisPoint = config.keyIndex;
         }
-        if (doKeyConfig) await server.SendCommandAsync(new PipeCommands.KeyDown { Config = config });
-        else CheckKey(config, true);
+        if (doKeyConfig || doKeySend) await server.SendCommandAsync(new PipeCommands.KeyDown { Config = config });
+        if (!doKeyConfig) CheckKey(config, true);
     }
 
     private async void ControllerAction_KeyUp(object sender, OVRKeyEventArgs e)
@@ -1529,10 +1768,10 @@ public class ControlWPFWindow : MonoBehaviour
         var config = new KeyConfig();
         config.type = KeyTypes.Controller;
         config.actionType = KeyActionTypes.Hand;
-        config.keyCode = (int)e.ButtonId;
+        config.keyCode = -2;
+        config.keyName = e.Name;
         config.isLeft = e.IsLeft;
-        config.keyIndex = e.IsAxis == false ? -1 : e.ButtonId == Valve.VR.EVRButtonId.k_EButton_SteamVR_Touchpad ? NearestPointIndex(e.IsLeft, e.Axis.x, e.Axis.y) : 0;
-        config.isOculus = IsOculus;
+        config.keyIndex = e.IsAxis == false ? -1 : NearestPointIndex(e.IsLeft, e.Axis.x, e.Axis.y, e.Name.Contains("Stick"));
         config.isTouch = e.IsTouch;
         if (e.IsAxis && config.keyIndex != (e.IsLeft ? lastLeftAxisPoint : lastRightAxisPoint))
         {//タッチパッド離した瞬間違うポイントだった場合
@@ -1547,8 +1786,8 @@ public class ControlWPFWindow : MonoBehaviour
             if (doKeyConfig) await server.SendCommandAsync(new PipeCommands.KeyDown { Config = config });
             else CheckKey(config, true);
         }
-        if (doKeyConfig) { }//  await server.SendCommandAsync(new PipeCommands.KeyUp { Config = config });
-        else CheckKey(config, false);
+        if (doKeyConfig || doKeySend) { }//  await server.SendCommandAsync(new PipeCommands.KeyUp { Config = config });
+        if (!doKeyConfig) CheckKey(config, false);
     }
 
     private int lastLeftAxisPoint = -1;
@@ -1559,23 +1798,26 @@ public class ControlWPFWindow : MonoBehaviour
     private async void ControllerAction_AxisChanged(object sender, OVRKeyEventArgs e)
     {
         if (e.IsAxis == false) return;
-        var newindex = NearestPointIndex(e.IsLeft, e.Axis.x, e.Axis.y);
+        var keyName = e.Name;
+        if (keyName.Contains("Trigger")) return; //トリガーは現時点ではアナログ入力無効
+        if (keyName.Contains("Position")) keyName = keyName.Replace("Position", "Touch"); //ポジションはいったんタッチと同じにする
+        var newindex = NearestPointIndex(e.IsLeft, e.Axis.x, e.Axis.y, keyName.Contains("Stick"));
         if ((e.IsLeft ? lastLeftAxisPoint : lastRightAxisPoint) != newindex)
         {//ドラッグで隣の領域に入った場合
             var config = new KeyConfig();
             config.type = KeyTypes.Controller;
             config.actionType = KeyActionTypes.Hand;
-            config.keyCode = (int)e.ButtonId;
+            config.keyCode = -2;
+            config.keyName = keyName;
             config.isLeft = e.IsLeft;
             config.keyIndex = (e.IsLeft ? lastLeftAxisPoint : lastRightAxisPoint);
-            config.isOculus = IsOculus;
-            config.isTouch = e.IsTouch;
+            config.isTouch = true;// e.IsTouch; //ポジションはいったんタッチと同じにする
             //前のキーを離す
-            if (doKeyConfig) { }//  await server.SendCommandAsync(new PipeCommands.KeyUp { Config = config });
-            else CheckKey(config, false);
+            if (doKeyConfig || doKeySend) { }//  await server.SendCommandAsync(new PipeCommands.KeyUp { Config = config });
+            if (!doKeyConfig) CheckKey(config, false);
             config.keyIndex = newindex;
             //新しいキーを押す
-            if (doKeyConfig)
+            if (doKeyConfig || doKeySend)
             {
                 if (isSendingKey == false)
                 {
@@ -1584,7 +1826,7 @@ public class ControlWPFWindow : MonoBehaviour
                     isSendingKey = false;
                 }
             }
-            else CheckKey(config, true);
+            if (!doKeyConfig) CheckKey(config, true);
             if (e.IsLeft) lastLeftAxisPoint = newindex;
             else lastRightAxisPoint = newindex;
         }
@@ -1598,8 +1840,8 @@ public class ControlWPFWindow : MonoBehaviour
         config.actionType = KeyActionTypes.Face;
         config.keyCode = e.KeyCode;
         config.keyName = e.KeyName;
-        if (doKeyConfig) await server.SendCommandAsync(new PipeCommands.KeyDown { Config = config });
-        else CheckKey(config, true);
+        if (doKeyConfig || doKeySend) await server.SendCommandAsync(new PipeCommands.KeyDown { Config = config });
+        if (!doKeyConfig) CheckKey(config, true);
     }
 
     private /*async*/ void KeyboardAction_KeyUp(object sender, KeyboardEventArgs e)
@@ -1609,25 +1851,25 @@ public class ControlWPFWindow : MonoBehaviour
         config.actionType = KeyActionTypes.Face;
         config.keyCode = e.KeyCode;
         config.keyName = e.KeyName;
-        if (doKeyConfig) { }//  await server.SendCommandAsync(new PipeCommands.KeyUp { Config = config });
-        else CheckKey(config, false);
+        if (doKeyConfig || doKeySend) { }//  await server.SendCommandAsync(new PipeCommands.KeyUp { Config = config });
+        if (!doKeyConfig) CheckKey(config, false);
     }
 
-    private int NearestPointIndex(bool isLeft, float x, float y)
+    private int NearestPointIndex(bool isLeft, float x, float y, bool isStick)
     {
         //Debug.Log($"SearchNearestPoint:{x},{y},{isLeft}");
         int index = 0;
-        var points = isLeft ? CurrentSettings.LeftTouchPadPoints : CurrentSettings.RightTouchPadPoints;
+        var points = isStick ? (isLeft ? CurrentSettings.LeftThumbStickPoints : CurrentSettings.RightThumbStickPoints) : (isLeft ? CurrentSettings.LeftTouchPadPoints : CurrentSettings.RightTouchPadPoints);
         if (points == null) return 0; //未設定時は一つ
         var centerEnable = isLeft ? CurrentSettings.LeftCenterEnable : CurrentSettings.RightCenterEnable;
-        if (centerEnable || IsOculus) //センターキー有効時(Oculusの場合はスティックなので、センター無効にする)
+        if (centerEnable || isStick) //センターキー有効時(タッチパッド) / スティックの場合はセンター無効にする
         {
             var point_distance = x * x + y * y;
             var r = 2.0f / 5.0f; //半径
             var r2 = r * r;
             if (point_distance < r2) //円内
             {
-                if (IsOculus) return -1;
+                if (isStick) return -1;
                 index = points.Count + 1;
                 return index;
             }
@@ -1832,10 +2074,51 @@ public class ControlWPFWindow : MonoBehaviour
 
     #endregion
 
+    #region EyeTracking
+
+
+    private void SetEyeTracking_TobiiOffsets(PipeCommands.SetEyeTracking_TobiiOffsets offsets)
+    {
+        CurrentSettings.EyeTracking_TobiiOffsetHorizontal = offsets.OffsetHorizontal;
+        CurrentSettings.EyeTracking_TobiiOffsetVertical = offsets.OffsetVertical;
+        CurrentSettings.EyeTracking_TobiiScaleHorizontal = offsets.ScaleHorizontal;
+        CurrentSettings.EyeTracking_TobiiScaleVertical = offsets.ScaleVertical;
+        SetEyeTracking_TobiiOffsetsAction?.Invoke(offsets);
+    }
+
+    public void SetEyeTracking_TobiiPosition(Transform position, float centerX, float centerY)
+    {
+        CurrentSettings.EyeTracking_TobiiPosition = StoreTransform.Create(position);
+        CurrentSettings.EyeTracking_TobiiCenterX = centerX;
+        CurrentSettings.EyeTracking_TobiiCenterY = centerY;
+    }
+
+    public Vector2 GetEyeTracking_TobiiLocalPosition(Transform saveto)
+    {
+        if (CurrentSettings.EyeTracking_TobiiPosition != null) CurrentSettings.EyeTracking_TobiiPosition.ToLocalTransform(saveto);
+        return new Vector2(CurrentSettings.EyeTracking_TobiiCenterX, CurrentSettings.EyeTracking_TobiiCenterY);
+    }
+    private void SetEyeTracking_ViveProEyeOffsets(PipeCommands.SetEyeTracking_ViveProEyeOffsets offsets)
+    {
+        CurrentSettings.EyeTracking_ViveProEyeOffsetHorizontal = offsets.OffsetHorizontal;
+        CurrentSettings.EyeTracking_ViveProEyeOffsetVertical = offsets.OffsetVertical;
+        CurrentSettings.EyeTracking_ViveProEyeScaleHorizontal = offsets.ScaleHorizontal;
+        CurrentSettings.EyeTracking_ViveProEyeScaleVertical = offsets.ScaleVertical;
+        SetEyeTracking_ViveProEyeOffsetsAction?.Invoke(offsets);
+    }
+    private void SetEyeTracking_ViveProEyeUseEyelidMovements(PipeCommands.SetEyeTracking_ViveProEyeUseEyelidMovements useEyelidMovements)
+    {
+        CurrentSettings.EyeTracking_ViveProEyeUseEyelidMovements = useEyelidMovements.Use;
+        SetEyeTracking_ViveProEyeUseEyelidMovementsAction?.Invoke(useEyelidMovements);
+    }
+
+
+    #endregion
+
     #region Setting
 
     [Serializable]
-    private class StoreTransform
+    public class StoreTransform
     {
         public Vector3 localPosition;
         public Vector3 position;
@@ -1865,10 +2148,22 @@ public class ControlWPFWindow : MonoBehaviour
             position = orig.position;
         }
 
+        public void SetPosition(Vector3 orig)
+        {
+            localPosition = orig;
+            position = orig;
+        }
+
         public void SetRotation(Transform orig)
         {
             localRotation = orig.localRotation;
             rotation = orig.rotation;
+        }
+
+        public void SetPositionAndRotation(Transform orig)
+        {
+            SetPosition(orig);
+            SetRotation(orig);
         }
 
         public Transform ToLocalTransform(Transform saveto)
@@ -1889,31 +2184,31 @@ public class ControlWPFWindow : MonoBehaviour
     }
 
     [Serializable]
-    private class LookTargetSettings
+    public class LookTargetSettings
     {
         public Vector3 Offset;
         public float Distance;
-        public static LookTargetSettings Create(CameraLookTarget target)
+        public static LookTargetSettings Create(CameraMouseControl target)
         {
-            return new LookTargetSettings { Offset = target.Offset, Distance = target.Distance };
+            return new LookTargetSettings { Offset = target.LookOffset, Distance = target.CameraDistance };
         }
-        public void Set(CameraLookTarget target)
+        public void Set(CameraMouseControl target)
         {
-            Offset = target.Offset; Distance = target.Distance;
+            Offset = target.LookOffset; Distance = target.CameraDistance;
         }
-        public void ApplyTo(CameraLookTarget target)
+        public void ApplyTo(CameraMouseControl target)
         {
-            target.Offset = Offset; target.Distance = Distance;
+            target.LookOffset = Offset; target.CameraDistance = Distance;
         }
         public void ApplyTo(Camera camera)
         {
-            var target = camera.GetComponent<CameraLookTarget>();
-            if (target != null) { target.Offset = Offset; target.Distance = Distance; }
+            var target = camera.GetComponent<CameraMouseControl>();
+            if (target != null) { target.LookOffset = Offset; target.CameraDistance = Distance; }
         }
     }
 
     [Serializable]
-    private class Settings
+    public class Settings
     {
         public string VRMPath = null;
         public StoreTransform headTracker = null;
@@ -1986,6 +2281,10 @@ public class ControlWPFWindow : MonoBehaviour
         [OptionalField]
         public List<UPoint> RightTouchPadPoints;
         [OptionalField]
+        public List<UPoint> LeftThumbStickPoints;
+        [OptionalField]
+        public List<UPoint> RightThumbStickPoints;
+        [OptionalField]
         public List<KeyAction> KeyActions = null;
         [OptionalField]
         public float LeftHandRotation = -90.0f;
@@ -2036,6 +2335,52 @@ public class ControlWPFWindow : MonoBehaviour
         [OptionalField]
         public int WebCamBuffering = 0;
 
+        [OptionalField]
+        public float CameraFOV = 60.0f;
+
+        [OptionalField]
+        public Color LightColor;
+        [OptionalField]
+        public float LightRotationX;
+        [OptionalField]
+        public float LightRotationY;
+
+        [OptionalField]
+        public int ScreenWidth = 0;
+        [OptionalField]
+        public int ScreenHeight = 0;
+        [OptionalField]
+        public int ScreenRefreshRate = 0;
+
+        //EyeTracking
+        [OptionalField]
+        public float EyeTracking_TobiiScaleHorizontal;
+        [OptionalField]
+        public float EyeTracking_TobiiScaleVertical;
+        [OptionalField]
+        public float EyeTracking_TobiiOffsetHorizontal;
+        [OptionalField]
+        public float EyeTracking_TobiiOffsetVertical;
+        [OptionalField]
+        public StoreTransform EyeTracking_TobiiPosition;
+        [OptionalField]
+        public float EyeTracking_TobiiCenterX;
+        [OptionalField]
+        public float EyeTracking_TobiiCenterY;
+        [OptionalField]
+        public float EyeTracking_ViveProEyeScaleHorizontal;
+        [OptionalField]
+        public float EyeTracking_ViveProEyeScaleVertical;
+        [OptionalField]
+        public float EyeTracking_ViveProEyeOffsetHorizontal;
+        [OptionalField]
+        public float EyeTracking_ViveProEyeOffsetVertical;
+        [OptionalField]
+        public bool EyeTracking_ViveProEyeUseEyelidMovements;
+
+        [OptionalField]
+        public bool EnableSkeletal;
+
         //初期値
         [OnDeserializing()]
         internal void OnDeserializingMethod(StreamingContext context)
@@ -2074,14 +2419,31 @@ public class ControlWPFWindow : MonoBehaviour
             WebCamResize = false;
             WebCamMirroring = false;
             WebCamBuffering = 0;
+
+            CameraFOV = 60.0f;
+
+            LightColor = Color.white;
+            LightRotationX = 130;
+            LightRotationY = 43;
+
+            ScreenWidth = 0;
+            ScreenHeight = 0;
+            ScreenRefreshRate = 0;
+
+            EyeTracking_TobiiScaleHorizontal = 0.5f;
+            EyeTracking_TobiiScaleVertical = 0.2f;
+            EyeTracking_ViveProEyeScaleHorizontal = 2.0f;
+            EyeTracking_ViveProEyeScaleVertical = 1.5f;
+            EyeTracking_ViveProEyeUseEyelidMovements = true;
+
+            EnableSkeletal = true;
         }
     }
 
-    private Settings CurrentSettings = new Settings();
+    public static Settings CurrentSettings = new Settings();
 
-    private void SaveSettings()
+    private void SaveSettings(string path)
     {
-        var path = WindowsDialogs.SaveFileDialog("設定保存先選択", ".json");
         if (string.IsNullOrEmpty(path))
         {
             return;
@@ -2089,16 +2451,30 @@ public class ControlWPFWindow : MonoBehaviour
         File.WriteAllText(path, Json.Serializer.ToReadable(Json.Serializer.Serialize(CurrentSettings)));
     }
 
-    private async void LoadSettings(bool LoadDefault = false, bool IsFirstTime = false)
+    private async void LoadSettings(bool LoadDefault = false, bool IsFirstTime = false, string path = null)
     {
         if (LoadDefault == false)
         {
-            var path = WindowsDialogs.OpenFileDialog("設定読み込み先選択", ".json");
             if (string.IsNullOrEmpty(path))
             {
                 return;
             }
             CurrentSettings = Json.Serializer.Deserialize<Settings>(File.ReadAllText(path));
+            //スケールを元に戻す
+            //トラッカーのルートスケールを初期値に戻す
+            HandTrackerRoot.localScale = new Vector3(1.0f, 1.0f, 1.0f);
+            HeadTrackerRoot.localScale = new Vector3(1.0f, 1.0f, 1.0f);
+            PelvisTrackerRoot.localScale = new Vector3(1.0f, 1.0f, 1.0f);
+            HandTrackerRoot.position = Vector3.zero;
+            HeadTrackerRoot.position = Vector3.zero;
+            PelvisTrackerRoot.position = Vector3.zero;
+            //スケール変更時の位置オフセット設定
+            var handTrackerOffset = HandTrackerRoot.GetComponent<ScalePositionOffset>();
+            var headTrackerOffset = HeadTrackerRoot.GetComponent<ScalePositionOffset>();
+            var footTrackerOffset = PelvisTrackerRoot.GetComponent<ScalePositionOffset>();
+            handTrackerOffset.ResetTargetAndPosition();
+            headTrackerOffset.ResetTargetAndPosition();
+            footTrackerOffset.ResetTargetAndPosition();
         }
         else
         {
@@ -2106,7 +2482,7 @@ public class ControlWPFWindow : MonoBehaviour
             {
                 try
                 {
-                    var path = Application.dataPath + "/../default.json";
+                    path = Application.dataPath + "/../default.json";
                     CurrentSettings = Json.Serializer.Deserialize<Settings>(File.ReadAllText(path));
                 }
                 catch (Exception ex)
@@ -2138,9 +2514,21 @@ public class ControlWPFWindow : MonoBehaviour
             await server.SendCommandAsync(new PipeCommands.LoadHideBorder { enable = CurrentSettings.HideBorder });
             SetWindowTopMost(CurrentSettings.IsTopMost);
             await server.SendCommandAsync(new PipeCommands.LoadIsTopMost { enable = CurrentSettings.IsTopMost });
+
+            SetCameraFOV(CurrentSettings.CameraFOV);
+            FreeCamera.GetComponent<CameraMouseControl>()?.CheckUpdate();
+            FrontCamera.GetComponent<CameraMouseControl>()?.CheckUpdate();
+            BackCamera.GetComponent<CameraMouseControl>()?.CheckUpdate();
+            PositionFixedCamera.GetComponent<CameraMouseControl>()?.CheckUpdate();
+
+
             if (CurrentSettings.FreeCameraTransform != null)
             {
                 CurrentSettings.FreeCameraTransform.ToLocalTransform(FreeCamera.transform);
+                var control = FreeCamera.GetComponent<CameraMouseControl>();
+                control.CameraAngle = -FreeCamera.transform.rotation.eulerAngles;
+                control.CameraDistance = Vector3.Distance(FreeCamera.transform.position, Vector3.zero);
+                control.CameraTarget = FreeCamera.transform.position + FreeCamera.transform.rotation * Vector3.forward * control.CameraDistance;
             }
             if (CurrentSettings.FrontCameraLookTargetSettings != null)
             {
@@ -2150,6 +2538,16 @@ public class ControlWPFWindow : MonoBehaviour
             {
                 CurrentSettings.BackCameraLookTargetSettings.ApplyTo(BackCamera);
             }
+            if (CurrentSettings.PositionFixedCameraTransform != null)
+            {
+                CurrentSettings.PositionFixedCameraTransform.ToLocalTransform(PositionFixedCamera.transform);
+                var control = PositionFixedCamera.GetComponent<CameraMouseControl>();
+                control.CameraAngle = -PositionFixedCamera.transform.rotation.eulerAngles;
+                control.CameraDistance = Vector3.Distance(PositionFixedCamera.transform.position, Vector3.zero);
+                control.CameraTarget = PositionFixedCamera.transform.position + PositionFixedCamera.transform.rotation * Vector3.forward * control.CameraDistance;
+                control.UpdateRelativePosition();
+            }
+            await server.SendCommandAsync(new PipeCommands.LoadCameraFOV { fov = CurrentSettings.CameraFOV });
 
             UpdateWebCamConfig();
             if (CurrentSettings.CameraType.HasValue)
@@ -2196,6 +2594,18 @@ public class ControlWPFWindow : MonoBehaviour
                 RightPoints = CurrentSettings.RightTouchPadPoints,
                 RightCenterEnable = CurrentSettings.RightCenterEnable
             });
+            await server.SendCommandAsync(new PipeCommands.LoadControllerStickPoints
+            {
+                LeftPoints = CurrentSettings.LeftThumbStickPoints,
+                RightPoints = CurrentSettings.RightThumbStickPoints,
+            });
+
+            KeyAction.KeyActionsUpgrade(CurrentSettings.KeyActions);
+
+            steamVR2Input.EnableSkeletal = CurrentSettings.EnableSkeletal;
+
+            await server.SendCommandAsync(new PipeCommands.LoadSkeletalInputEnable { enable = CurrentSettings.EnableSkeletal });
+
             await server.SendCommandAsync(new PipeCommands.LoadKeyActions { KeyActions = CurrentSettings.KeyActions });
             await server.SendCommandAsync(new PipeCommands.LoadHandRotations { LeftHandRotation = CurrentSettings.LeftHandRotation, RightHandRotation = CurrentSettings.RightHandRotation });
             UpdateHandRotation();
@@ -2203,7 +2613,36 @@ public class ControlWPFWindow : MonoBehaviour
             await server.SendCommandAsync(new PipeCommands.LoadLipSyncEnable { enable = CurrentSettings.LipSyncEnable });
             SetLipSyncEnable(CurrentSettings.LipSyncEnable);
 
+            await server.SendCommandAsync(new PipeCommands.SetLightAngle { X = CurrentSettings.LightRotationX, Y = CurrentSettings.LightRotationY });
+            SetLightAngle(CurrentSettings.LightRotationX, CurrentSettings.LightRotationY);
+            await server.SendCommandAsync(new PipeCommands.ChangeLightColor { a = CurrentSettings.LightColor.a, r = CurrentSettings.LightColor.r, g = CurrentSettings.LightColor.g, b = CurrentSettings.LightColor.b });
+            ChangeLightColor(CurrentSettings.LightColor.a, CurrentSettings.LightColor.r, CurrentSettings.LightColor.g, CurrentSettings.LightColor.b);
+
+            if (Screen.resolutions.Any(d => d.width == CurrentSettings.ScreenWidth && d.height == CurrentSettings.ScreenHeight && d.refreshRate == CurrentSettings.ScreenRefreshRate))
+            {
+                Screen.SetResolution(CurrentSettings.ScreenWidth, CurrentSettings.ScreenHeight, false, CurrentSettings.ScreenRefreshRate);
+            }
+
+            SetEyeTracking_TobiiOffsetsAction?.Invoke(new PipeCommands.SetEyeTracking_TobiiOffsets
+            {
+                OffsetHorizontal = CurrentSettings.EyeTracking_TobiiOffsetHorizontal,
+                OffsetVertical = CurrentSettings.EyeTracking_TobiiOffsetVertical,
+                ScaleHorizontal = CurrentSettings.EyeTracking_TobiiScaleHorizontal,
+                ScaleVertical = CurrentSettings.EyeTracking_TobiiScaleVertical
+            });
+
+            SetEyeTracking_ViveProEyeOffsetsAction?.Invoke(new PipeCommands.SetEyeTracking_ViveProEyeOffsets
+            {
+                OffsetHorizontal = CurrentSettings.EyeTracking_ViveProEyeOffsetHorizontal,
+                OffsetVertical = CurrentSettings.EyeTracking_ViveProEyeOffsetVertical,
+                ScaleHorizontal = CurrentSettings.EyeTracking_ViveProEyeScaleHorizontal,
+                ScaleVertical = CurrentSettings.EyeTracking_ViveProEyeScaleVertical
+            });
+
+            AdditionalSettingAction?.Invoke(null);
+
             await server.SendCommandAsync(new PipeCommands.SetWindowNum { Num = CurrentWindowNum });
+
         }
     }
 
@@ -2239,28 +2678,50 @@ public class ControlWPFWindow : MonoBehaviour
     // Update is called once per frame
     void Update()
     {
-        CameraMouseEvent();
         KeyboardAction.Update();
+
+        //if (Input.GetKeyDown(KeyCode.P))
+        //{
+        //    TakePhoto(16000, true);
+        //}
+    }
+
+    private void TakePhoto(int width, bool transparentBackground, string directory = null)
+    {
+        Debug.Log($"Resolution:{(int)Screen.currentResolution.width}x{(int)Screen.currentResolution.height}");
+        var res = new Resolution { width = width, height = (int)((double)width / (double)Screen.currentResolution.width * (double)Screen.currentResolution.height) };
+        if (string.IsNullOrWhiteSpace(directory)) directory = Application.dataPath + "/../Photos";
+        if (Directory.Exists(directory) == false)
+        {
+            Directory.CreateDirectory(directory);
+        }
+        var filename = $"VirtualMotionCapture_{res.width}x{res.height}_{DateTime.Now:yyyy-MM-dd_HH-mm-ss.fff}.png";
+        if (transparentBackground) BackgroundRenderer.gameObject.SetActive(false);
+        File.WriteAllBytes(Path.Combine(directory, filename), Photo.TakePNGPhoto(currentCamera, res, transparentBackground));
+        if (transparentBackground) BackgroundRenderer.gameObject.SetActive(true);
+        Debug.Log($"Save Photo: {filename}");
     }
 
     private int WindowX;
     private int WindowY;
     private Vector2 OldMousePos;
+    private bool isWindowDragging = false;
 
     void LateUpdate()
     {
         //Windowの移動操作
         //ドラッグ開始
-        if (Input.GetMouseButtonDown(0))
+        if (Input.GetMouseButtonDown((int)MouseButtons.Left) && Input.GetKey(KeyCode.LeftAlt) == false && Input.GetKey(KeyCode.RightAlt) == false)
         {
             var r = GetUnityWindowPosition();
             WindowX = r.left;
             WindowY = r.top;
             OldMousePos = GetWindowsMousePosition();
+            isWindowDragging = true;
         }
 
         //ドラッグ中
-        if (Input.GetMouseButton(0))
+        if (Input.GetMouseButton((int)MouseButtons.Left) && isWindowDragging)
         {
             Vector2 pos = GetWindowsMousePosition();
             if (pos != OldMousePos)
@@ -2270,6 +2731,11 @@ public class ControlWPFWindow : MonoBehaviour
                 SetUnityWindowPosition(WindowX, WindowY);
                 OldMousePos = pos;
             }
+        }
+
+        if (Input.GetMouseButtonUp((int)MouseButtons.Left) && isWindowDragging)
+        {
+            isWindowDragging = false;
         }
     }
 }
